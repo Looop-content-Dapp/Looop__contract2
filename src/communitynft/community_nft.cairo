@@ -5,7 +5,7 @@ const PAUSER_ROLE: felt252 = selector!("PAUSER_ROLE");
 const MINTER_ROLE: felt252 = selector!("MINTER_ROLE");
 
 #[starknet::contract]
-pub mod CommunityNFT {
+pub mod TribesNFT {
     use core::num::traits::Zero;
     use openzeppelin::access::accesscontrol::AccessControlComponent;
     use openzeppelin::introspection::src5::SRC5Component;
@@ -127,7 +127,7 @@ pub mod CommunityNFT {
         }
 
         #[external(v0)]
-        fn mint_community_nft(ref self: ContractState, recipient: ContractAddress) {
+        fn mint_tribes_nft(ref self: ContractState, recipient: ContractAddress) {
             let balance = self.erc721.balance_of(recipient);
             assert(balance.is_zero(), 'ALREADY_MINTED');
             
