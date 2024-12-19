@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 pub use starknet::{
     ContractAddress, class_hash::ClassHash, syscalls::deploy_syscall, SyscallResultTrait,
-    storage::{Map, StoragePointerReadAccess, StoragePointerWriteAccess},
-    account::Call
+    storage::{Map, StoragePointerReadAccess, StoragePointerWriteAccess}, account::Call
 };
 
 #[derive(Drop, Serde, starknet::Store)]
@@ -34,8 +33,11 @@ pub trait ILooopContract<TContractState> {
         implementation_hash: felt252,
         salt: felt252
     ) -> ContractAddress;
+    fn update_agreement_uri(ref self: TContractState, agreement_uri: ByteArray);
+    fn sign_agreement(ref self: TContractState);
     fn get_account_count(self: @TContractState) -> u32;
     fn get_account_owner_details(self: @TContractState, email: felt252) -> User;
+    fn check_artist_signed_agreement(self: @TContractState) -> bool;
 }
 
 
@@ -48,7 +50,9 @@ pub mod LooopContract {
     use core::poseidon::PoseidonTrait;
 
     use starknet::{
-        ClassHash, ContractAddress, storage::{Map, StoragePointerReadAccess, StoragePointerWriteAccess}, get_caller_address, get_contract_address, account::Call
+        ClassHash, ContractAddress,
+        storage::{Map, StoragePointerReadAccess, StoragePointerWriteAccess, StoragePathEntry},
+        get_caller_address, get_contract_address, get_block_timestamp, account::Call
     };
 
     use looop_contract::interfaces::IRegistry::{
@@ -70,9 +74,11 @@ pub mod LooopContract {
         account_count: u32,
         version: u8,
         owner: ContractAddress,
+        agreement_uri: ByteArray,
         users: Map::<felt252, User>,
+        artist_signed_agreement: Map::<ContractAddress, bool>,
         // #[substorage(v0)]
-        // account: AccountComponent::Storage,
+    // account: AccountComponent::Storage,
     }
 
     #[event]
@@ -80,7 +86,9 @@ pub mod LooopContract {
     enum Event {
         // #[flat]
         // AccountEvent: AccountComponent::Event,
-        CreatedAccount: CreatedAccount
+        CreatedAccount: CreatedAccount,
+        UpdatedAgreement: UpdatedAgreement,
+        AgreementSigned: AgreementSigned,
     }
 
 
@@ -90,9 +98,22 @@ pub mod LooopContract {
         address: ContractAddress
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct UpdatedAgreement {
+        updater: ContractAddress,
+        time: u64,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct AgreementSigned {
+        signer: ContractAddress,
+        time: u64,
+    }
+
     #[constructor]
-    fn constructor(ref self: ContractState, _owner: ContractAddress,) {
+    fn constructor(ref self: ContractState, _owner: ContractAddress, agreement_uri: ByteArray) {
         self.owner.write(_owner);
+        self.agreement_uri.write(agreement_uri);
     }
 
     const REGISTRY_CLASS_HASH: felt252 =
@@ -111,7 +132,7 @@ pub mod LooopContract {
             let account_address = IRegistryLibraryDispatcher {
                 class_hash: REGISTRY_CLASS_HASH.try_into().unwrap()
             }
-            .create_account(implementation_hash, nft_contract_address, nft_token_id, salt);
+                .create_account(implementation_hash, nft_contract_address, nft_token_id, salt);
 
             let hashed_pass_key = PoseidonTrait::new().update_with(pass_key).finalize();
 
@@ -128,9 +149,23 @@ pub mod LooopContract {
 
             self.account_count.write(self.account_count.read() + 1);
 
-            self.emit(CreatedAccount {id: self.account_count.read() + 1, address: account_address});
+            self
+                .emit(
+                    CreatedAccount { id: self.account_count.read() + 1, address: account_address }
+                );
 
             account_address
+        }
+
+        fn sign_agreement(ref self: ContractState) {
+            let caller = get_caller_address();
+            let artist_signed_agreement = self.check_artist_signed_agreement();
+            assert(!artist_signed_agreement, 'AGREEMENT ALREADY SIGNED');
+            self.artist_signed_agreement.entry(caller).write(true);
+            self.emit(AgreementSigned {
+                signer: caller,
+                time: get_block_timestamp(),
+            })
         }
 
         fn fetch_account(
@@ -143,9 +178,24 @@ pub mod LooopContract {
             let account_address = IRegistryLibraryDispatcher {
                 class_hash: REGISTRY_CLASS_HASH.try_into().unwrap()
             }
-            .get_account(implementation_hash, nft_contract_address, nft_token_id, salt);
+                .get_account(implementation_hash, nft_contract_address, nft_token_id, salt);
 
             account_address
+        }
+
+        fn update_agreement_uri(ref self: ContractState, agreement_uri: ByteArray) {
+            let caller = get_caller_address();
+            assert(caller == self.owner.read(), 'NOT OWNER');
+            self.agreement_uri.write(agreement_uri);
+            self.emit(UpdatedAgreement {
+                updater: caller,
+                time: get_block_timestamp(),
+            })
+        }
+
+        fn check_artist_signed_agreement(self: @ContractState) -> bool {
+            let caller = get_caller_address();
+            self.artist_signed_agreement.entry(caller).read()
         }
 
         fn get_account_owner_details(self: @ContractState, email: felt252) -> User {
