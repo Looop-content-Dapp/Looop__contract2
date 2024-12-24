@@ -33,11 +33,23 @@ pub trait ILooopContract<TContractState> {
         implementation_hash: felt252,
         salt: felt252
     ) -> ContractAddress;
+    fn complete_nft_transaction(
+        ref self: TContractState,
+        nft_address: ContractAddress,
+        buyer: ContractAddress,
+        token_id: u256,
+        amount: u256
+    );
     fn update_agreement_uri(ref self: TContractState, agreement_uri: ByteArray);
+    fn update_whitelisted_signer(ref self: TContractState, new_signer: ContractAddress);
+    fn update_payment_token(ref self: TContractState, token_address: ContractAddress);
     fn sign_agreement(ref self: TContractState);
+    fn withdraw(ref self: TContractState, token: ContractAddress, recipient: ContractAddress, amount: u256);
     fn get_account_count(self: @TContractState) -> u32;
     fn get_account_owner_details(self: @TContractState, email: felt252) -> User;
-    fn check_artist_signed_agreement(self: @TContractState) -> bool;
+    fn check_artist_signed_agreement(self: @TContractState, artist: ContractAddress) -> bool;
+    fn get_payment_token_address(self: @TContractState) -> ContractAddress;
+    fn get_whitelisted_signer(self: @TContractState) -> ContractAddress;
 }
 
 
@@ -48,6 +60,7 @@ pub mod LooopContract {
     use core::starknet::SyscallResultTrait;
     use core::hash::{HashStateTrait, HashStateExTrait};
     use core::poseidon::PoseidonTrait;
+    use core::num::traits::Zero;
 
     use starknet::{
         ClassHash, ContractAddress,
@@ -58,6 +71,9 @@ pub mod LooopContract {
     use looop_contract::interfaces::IRegistry::{
         IRegistryDispatcher, IRegistryDispatcherTrait, IRegistryLibraryDispatcher
     };
+
+    use looop_contract::interfaces::IERC721::{IERC721, IERC721Dispatcher, IERC721DispatcherTrait};
+    use openzeppelin::token::erc20::interface::{IERC20DispatcherTrait, IERC20Dispatcher,};
 
     // use token_bound_accounts::{
     //     interfaces::IAccount::IAccount,
@@ -74,6 +90,8 @@ pub mod LooopContract {
         account_count: u32,
         version: u8,
         owner: ContractAddress,
+        payment_token: ContractAddress,
+        whitelisted_signer: ContractAddress,
         agreement_uri: ByteArray,
         users: Map::<felt252, User>,
         artist_signed_agreement: Map::<ContractAddress, bool>,
@@ -89,6 +107,8 @@ pub mod LooopContract {
         CreatedAccount: CreatedAccount,
         UpdatedAgreement: UpdatedAgreement,
         AgreementSigned: AgreementSigned,
+        WhitelistedSignerUpdated: WhitelistedSignerUpdated,
+        PaymentTokenUpdated: PaymentTokenUpdated,
     }
 
 
@@ -110,9 +130,29 @@ pub mod LooopContract {
         time: u64,
     }
 
+    #[derive(Drop, starknet::Event)]
+    struct WhitelistedSignerUpdated {
+        new_signer: ContractAddress,
+        time: u64,
+    }
+
+    #[derive(Drop, starknet::Event)]
+    struct PaymentTokenUpdated {
+        token_address: ContractAddress,
+        time: u64,
+    }
+
     #[constructor]
-    fn constructor(ref self: ContractState, _owner: ContractAddress, agreement_uri: ByteArray) {
+    fn constructor(
+        ref self: ContractState,
+        _owner: ContractAddress,
+        payment_token: ContractAddress,
+        whitelisted_signer: ContractAddress,
+        agreement_uri: ByteArray
+    ) {
         self.owner.write(_owner);
+        self.payment_token.write(payment_token);
+        self.whitelisted_signer.write(whitelisted_signer);
         self.agreement_uri.write(agreement_uri);
     }
 
@@ -159,13 +199,36 @@ pub mod LooopContract {
 
         fn sign_agreement(ref self: ContractState) {
             let caller = get_caller_address();
-            let artist_signed_agreement = self.check_artist_signed_agreement();
+            let artist_signed_agreement = self.check_artist_signed_agreement(caller);
             assert(!artist_signed_agreement, 'AGREEMENT ALREADY SIGNED');
             self.artist_signed_agreement.entry(caller).write(true);
-            self.emit(AgreementSigned {
-                signer: caller,
-                time: get_block_timestamp(),
-            })
+            self.emit(AgreementSigned { signer: caller, time: get_block_timestamp(), })
+        }
+
+        ///@notice Function triggered by client after payment is received for nft on the backend
+        /// @notice A whitelisted signer is an account that triggers smart contract to complete nft transaction
+        /// Whitelisted account should be implemented on the backend.
+        /// Access is restricted to whitelisted signer for security
+        /// Only one payment token is available (team can add more if they deem it needful)
+        fn complete_nft_transaction(
+            ref self: ContractState,
+            nft_address: ContractAddress,
+            buyer: ContractAddress,
+            token_id: u256,
+            amount: u256
+        ) {
+            let caller = get_caller_address();
+            let nft_owner = IERC721Dispatcher { contract_address: nft_address }.owner_of(token_id);
+
+            assert(caller == self.whitelisted_signer.read(), 'UNAUTHORIZED CALLER');
+
+            let artist_royalty = self.perc(amount);
+            let data = array![];
+
+            IERC721Dispatcher { contract_address: nft_address }
+                .safe_transfer_from(nft_owner, buyer, token_id, data.span());
+            IERC20Dispatcher { contract_address: self.payment_token.read() }
+                .transfer(nft_owner, artist_royalty);
         }
 
         fn fetch_account(
@@ -183,19 +246,42 @@ pub mod LooopContract {
             account_address
         }
 
+
+        fn update_whitelisted_signer(ref self: ContractState, new_signer: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.owner.read(), 'NOT OWNER');
+            assert(new_signer.is_non_zero(), 'INVALID ADDRESS');
+            self.whitelisted_signer.write(new_signer);
+            self.emit(WhitelistedSignerUpdated { new_signer, time: get_block_timestamp(), });
+        }
+
+        fn update_payment_token(ref self: ContractState, token_address: ContractAddress) {
+            let caller = get_caller_address();
+            assert(caller == self.owner.read(), 'NOT OWNER');
+            assert(token_address.is_non_zero(), 'INVALID ADDRESS');
+            self.payment_token.write(token_address);
+            self.emit(PaymentTokenUpdated { token_address, time: get_block_timestamp(), });
+        }
+
         fn update_agreement_uri(ref self: ContractState, agreement_uri: ByteArray) {
             let caller = get_caller_address();
             assert(caller == self.owner.read(), 'NOT OWNER');
             self.agreement_uri.write(agreement_uri);
-            self.emit(UpdatedAgreement {
-                updater: caller,
-                time: get_block_timestamp(),
-            })
+            self.emit(UpdatedAgreement { updater: caller, time: get_block_timestamp(), })
         }
 
-        fn check_artist_signed_agreement(self: @ContractState) -> bool {
+        fn withdraw(ref self: ContractState, token: ContractAddress, recipient: ContractAddress, amount: u256) {
             let caller = get_caller_address();
-            self.artist_signed_agreement.entry(caller).read()
+            assert(caller == self.owner.read(), 'NOT OWNER');
+            assert(recipient.is_non_zero(), 'INVALID RECIPIENT');
+            assert(amount > 0, 'INVALID AMOUNT');
+            let success = IERC20Dispatcher { contract_address: token }.transfer(recipient, amount);
+            assert(success, 'WITHDRAW FAIL!');
+        }
+
+
+        fn check_artist_signed_agreement(self: @ContractState, artist: ContractAddress) -> bool {
+            self.artist_signed_agreement.entry(artist).read()
         }
 
         fn get_account_owner_details(self: @ContractState, email: felt252) -> User {
@@ -204,6 +290,14 @@ pub mod LooopContract {
 
         fn get_account_count(self: @ContractState) -> u32 {
             self.account_count.read()
+        }
+
+        fn get_payment_token_address(self: @ContractState) -> ContractAddress {
+            self.payment_token.read()
+        }
+
+        fn get_whitelisted_signer(self: @ContractState) -> ContractAddress {
+            self.whitelisted_signer.read()
         }
 
         fn upgrade(ref self: ContractState, new_class_hash: ClassHash) {
@@ -218,6 +312,14 @@ pub mod LooopContract {
 
         fn version(self: @ContractState) -> u8 {
             self.version.read()
+        }
+    }
+
+    #[generate_trait]
+    impl Private of PrivateTrait {
+        fn perc(self: @ContractState, amount: u256) -> u256 {
+            let artist_royalty: u256 = (amount * 70) / 100;
+            artist_royalty
         }
     }
 }
